@@ -1,0 +1,350 @@
+---
+title: "Step5_causal_forest"
+author: "Xiaoliuxu"
+date: "4/27/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warnings = FALSE, message = FALSE )
+```
+
+# In this file, I program for Causal Forest Estimation.  
+
+```{r, include=FALSE}
+# import library 
+library(dplyr)
+library(arsenal)
+library(rpart)
+library(rpart.plot)
+library(data.table)
+library(devtools)
+library(causalTree)
+library(reshape2)
+library(summarytools)
+library(ggplot2)
+library(grid)
+library(libcoin)
+library(mvtnorm)
+library(partykit)
+library(randomForest)
+library(tidyverse)
+library(qwraps2)
+library(table1)
+library(foreach)
+library(iterators)
+library(modeltools)
+library(stats4)
+library(party)
+library(partykit)
+library(caret)
+library(xtable)
+library(grf)
+if(packageVersion("grf") < '0.10.2') {
+  warning("This script requires grf 0.10.2 or higher")
+}
+library(sandwich)
+library(lmtest)
+library(Hmisc)
+library(ggplot2)
+library(gtsummary)  # used to generate summary table 
+library(plm)
+library(readxl)
+library(htetree)
+```
+
+
+```{r}
+# import merge data set, which includes all other variables (same as the causal tree)
+merge2_psm <- read.table("merge2_psm.txt")
+exchange_rate <- read_excel('annual_exchange_rate.xlsx')
+
+mean_rate <- mean(exchange_rate$usd_per_won)
+
+merge2_psm$sales.usd <- merge2_psm$sales.w*mean_rate/1000000
+merge2_psm$adv.usd <- merge2_psm$advertising.expense.w*mean_rate/1000
+
+full_data_ct <- merge2_psm
+
+```
+
+# detrend SALES 
+```{r recho = T}
+# detrend SALES 
+myvars <- c("ID","year","sales.usd","roa.w","roe.w","iso14001","public","ksic","region","leverage.w","turnover.w","export_ratio.w","size","rd_ratio.w","HHI.w","adv.usd","age","pr_score") # select specific columns used to generate causal forest 
+
+full_data_ct <- full_data_ct[myvars]
+full_data_ct$year2 <- ifelse(full_data_ct$year==2001,1,
+                             ifelse(full_data_ct$year==2002,2,
+                                    ifelse(full_data_ct$year==2003,3,
+                                           ifelse(full_data_ct$year==2004,4, 
+                                                  ifelse(full_data_ct$year==2005,5,
+                                                         ifelse(full_data_ct$year==2006,6,
+                                                                ifelse(full_data_ct$year==2007,7,
+                                                                       ifelse(full_data_ct$year==2008,8,
+                                                                              ifelse(full_data_ct$year==2009,9,
+                                                                                     ifelse(full_data_ct$year==2010,10,
+                                                                                            ifelse(full_data_ct$year==2011,11,
+                                                                                                   ifelse(full_data_ct$year==2012,12,
+                                                                                                          ifelse(full_data_ct$year==2013,13,
+                                                                                                                 ifelse(full_data_ct$year==2014,14,NA))))))))))))))
+# prediction for sales
+ols <- lm(sales.usd ~ year2,
+          data = full_data_ct)    # only include time trend 
+full_data_ct$predicted_sales <- predict(ols,data=full_data_ct)
+```
+
+# create 1 and 2 year lag of iso14001 
+```{r}
+# create 1 and 2 year lag of iso14001, save the dataset 
+full_data_ct_1 <- pdata.frame(full_data_ct,index = c("ID","year"))
+full_data_ct_1$iso14001_1 <- lag(full_data_ct_1$iso14001,1)   # create lag 1 but also create some NAs 
+full_data_ct_1 <- full_data_ct_1[complete.cases(full_data_ct_1), ]   # remove NAs 
+
+full_data_ct_2 <- pdata.frame(full_data_ct,index = c("ID","year"))
+full_data_ct_2$iso14001_2 <- lag(full_data_ct_2$iso14001,2)   # create lag 2 but also create some NAs 
+full_data_ct_2 <- full_data_ct_2[complete.cases(full_data_ct_2), ]   # remove NAs 
+
+```
+
+# prepare data for each dependent variable
+```{r}
+# prepare data for each dependent variable
+data_select <- function(input, dep, outdata){
+  myvars <- c("ID",dep,"iso14001","public","year","ksic","region","leverage.w","turnover.w","export_ratio.w","size","rd_ratio.w","HHI.w","adv.usd","age","pr_score") # select specific columns used to generate causal forest 
+  outdata <- input[myvars]
+  colnames(outdata)[1:16] <- c("ID","y","w","public","year","ksic","region","debt_to_equity","sales_to_assets","export_ratio","size","rd_ratio","HHI","advertising_expense","age","propens")
+  outdata <- fastDummies::dummy_cols(outdata,select_columns = "ksic")
+  
+}
+
+# First: Baseline model preparation first.
+sales <- data_select(input = full_data_ct, dep="predicted_sales",outdata=sales)
+
+roa <- data_select(input = full_data_ct, dep="roa.w",outdata=roa)
+
+roe <- data_select(input = full_data_ct, dep="roe.w",outdata=roe)
+
+# Second: lag1 model preparation 
+sales_1 <- data_select(input = full_data_ct_1, dep="predicted_sales",outdata=sales)
+
+roa_1 <- data_select(input = full_data_ct_1, dep="roa.w",outdata=roa)
+
+roe_1 <- data_select(input = full_data_ct_1, dep="roe.w",outdata=roe)
+
+
+#Third: lag2 model preparation 
+sales_2 <- data_select(input = full_data_ct_2, dep="predicted_sales",outdata=sales)
+
+roa_2 <- data_select(input = full_data_ct_2, dep="roa.w",outdata=roa)
+
+roe_2 <- data_select(input = full_data_ct_2, dep="roe.w",outdata=roe)
+
+```
+
+# In this chunk, I wrote a function to save causal forest restults. I split the whole sample into training and test sets by firm ID. I train the causal forest using training sample and estimate the individual treatment effect using the test sample. 
+```{r}
+# write a function to save the causal forest results 
+myforest <- function(seed, input,p,title){
+
+# prepare training and test sample 
+  set.seed(seed)
+g <- runif(nrow(input))
+full_data_ct_r <- input[order(g),]
+  # method 1 to split data 
+   # library(caret)
+   # train.index <- createDataPartition(full_data_ct_r$w, p =p, list = FALSE)
+   # dataDisTrain <- full_data_ct_r[ train.index,]
+   # dataDisTest  <- full_data_ct_r[-train.index,]
+  
+  # method 2 to split data 
+  # n <- nrow(input)
+  # ntr <- ROUND(0.75*n)
+  # ntest <- round(0.25*n)
+  # dataDisTrain <- full_data_ct_r
+  
+  # method 3 to split data 
+  library(groupdata2)
+  full_data_ct_r$ID <- factor(full_data_ct_r$ID)
+  parts <- partition(full_data_ct_r, p = p, id_col = "ID") # here p represent the fraction for test data
+  dataDisTest <<- parts[[1]]
+  dataDisTrain <<- parts[[2]]
+  
+# prepare X 
+x_vars <<- c('public','debt_to_equity','sales_to_assets','export_ratio','size','rd_ratio','advertising_expense','age','ksic_10','ksic_25','ksic_13',
+              'ksic_26','ksic_31','ksic_23','ksic_24','ksic_30','ksic_14','ksic_18','ksic_29','ksic_22','ksic_28',
+              'ksic_20','ksic_27','ksic_21','ksic_19','ksic_32','ksic_17','ksic_33','ksic_11','ksic_15','ksic_16','ksic_12')
+X_train <<- dataDisTrain[x_vars]
+X_test <<- dataDisTest[x_vars]
+
+# prepare Y 
+Y_train <<- dataDisTrain$y
+Y_test <<- dataDisTest$y
+
+# prepare W
+W_train <<- dataDisTrain$w
+W_test <<- dataDisTest$w
+
+# prepare id 
+firm.id_train <<- dataDisTrain$ID
+firm.id_test <<- dataDisTest$ID
+
+# train a causal forest (should be on the trainging data set )
+c.forest <<- causal_forest(X=X_train, Y=Y_train, W=W_train,clusters = firm.id_train, min.node.size=20,num.trees= 2000, seed = 115)   # option 1 honesty splitting 
+average_treatment_effect(c.forest, target.sample = "treated")
+# saveRDS(cf1_l2, "./cf1_l2.rds")
+# cf1_l2 <- readRDS("./cf1_l2.rds")
+
+# predict using the forest 
+dataDisTest$prediction <- predict(c.forest, X_test)$predictions
+
+# summary statistics of predicted tau 
+
+data <- dataDisTest
+data$effects <- ifelse(data$prediction > 0,"positive","negative") # group the predicted tau into positive and negative values
+
+data$quantile <- ntile(data$prediction, 10)  # group the predicted tau into 10 deciles
+
+data_select <- data %>%
+  select(y,w,public,debt_to_equity,sales_to_assets,export_ratio,size, rd_ratio,advertising_expense,age,prediction,quantile)
+
+group_sum <- data_select %>%
+  tbl_summary(
+    by = quantile,
+    type = all_continuous() ~ "continuous2",
+    statistic = all_continuous() ~ c("{mean} ({sd})",
+                                     "{min}, {max}"),
+    digits = all_continuous() ~ 2)
+
+sample_sum <- data_select %>%
+  tbl_summary(
+    type = all_continuous() ~ "continuous2",
+    statistic = all_continuous() ~ c("{mean} ({sd})",
+                                     "{min}, {max}"),
+    digits = all_continuous() ~ 2)
+
+tbl_merge(
+  tbls = list(group_sum, sample_sum),
+  tab_spanner = c("**group summary**","**whole sample summary**") )%>%
+  as_gt() %>%
+  gt::tab_header(title = title)
+
+
+  imp1 <<- variable_importance(c.forest,decay.exponent=2,max.depth=4)
+
+}
+
+```
+
+# Below I wrote a function to plot the importance metric estimated from the grf function
+```{r}
+VarImpplot <- function(input){
+x_vars_formal <<- c('Public','Debt to Equity Ratio', 'Sales to Assets Ratio','Export to Sales Ratio','Firm size',
+             'R&D to Sales Ratio','Advertising Expense','Age','ksic 10','ksic 25','ksic 13','ksic 26',
+              'ksic 31','ksic 23','ksic 24','ksic 30','ksic 14','ksic 18','ksic 29','ksic 22','ksic 28',
+              'ksic 20','ksic 27','ksic 21','ksic 19','ksic 32','ksic 17','ksic 33','ksic 11','ksic 15',
+             'ksic 16','ksic 12')
+
+ names <- data.frame(x_vars_formal)
+
+ df1 <- data.frame(cbind(input,names))
+
+   df2 <- df1 %>% 
+  tibble::rownames_to_column() %>% 
+  dplyr::rename("variable" = x_vars_formal) %>% 
+  dplyr::rename("imp" = input) %>% 
+  dplyr::arrange(desc(imp)) %>%
+  dplyr::mutate(variable = forcats::fct_inorder(variable))
+  
+  df3 <- df2[1:10,]
+  
+  # df3 <- df3 %>%
+  #   dplyr::arrange(imp) 
+  #   
+  df4 <- df3
+  df4$imp <- as.numeric(as.character(df3[,2])) 
+
+  ggplot2::ggplot(df4) +
+  geom_segment(aes(x = reorder(variable,imp), y = 0, xend = variable, yend = imp), 
+               size = 2, alpha = 2) +
+  geom_point(aes(x = reorder(variable,imp), y = imp, col = variable), 
+             size = 4, show.legend = F) +
+#  scale_x_reverse() +
+#  scale_y_reverse() +
+  coord_flip() +
+  labs(x ="Variable", y = "Variable Importance") +
+  theme_bw() 
+}
+```
+
+
+
+# causal forest estimation 
+## Baseline result1: SALES Baseline model
+```{r fig1, fig.height = 8, fig.width = 15}
+# baseline SALES model 
+myforest(seed=12, input=sales,p=0.4,title = 'SALES Baseline model') # generate forest results on detrended winsorized sales, without year lag of ISO 14001  
+
+imp_sales_forest <- VarImpplot(imp1)
+imp_sales_forest
+
+```
+
+## Baseline result2: ROA Baseline model
+```{r fig2, fig.height = 6, fig.width = 10}
+# baseline ROA model 
+myforest(seed=12,input=roa,p=0.4,title = 'ROA Baseline model') # generate forest results on ROA
+
+imp_roa_forest <- VarImpplot(imp1)
+imp_roa_forest
+
+```
+
+## Baseline result3: ROE Baseline model
+```{r fig3, fig.height = 6, fig.width = 10}
+# baseline ROE model 
+myforest(seed=12,input=roe,p=0.4,title = 'ROE Baseline model')  # generate forest results on ROE
+imp_roe_forest <- VarImpplot(imp1)
+imp_roe_forest
+```
+
+
+## 1 YEAR lag result1: SALES
+```{r fig4, fig.height = 6, fig.width = 10}
+# baseline SALES model 
+myforest(seed=12, input=sales_1,p=0.4,title = 'SALES lag1 model') # generate forest results on detrended winsorized sales, without year lag of ISO 14001  
+
+```
+
+## 1 YEAR lag result2: ROA
+```{r fig5, fig.height = 6, fig.width = 10}
+# baseline ROA model 
+myforest(seed=12,input=roa_1,p=0.4,title = 'ROA lag1 model') # generate forest results on ROA
+```
+
+## 1 YEAR lag result3: ROE 
+```{r fig6, fig.height = 6, fig.width = 10}
+# baseline ROE model 
+myforest(seed=12,input=roe_1,p=0.4,title = 'ROE lag1 model')  # generate forest results on ROE
+```
+
+## 2 YEAR lag result1: SALES
+```{r fig7, fig.height = 6, fig.width = 10}
+# baseline SALES model 
+myforest(seed=12, input=sales_2,p=0.4,title = 'SALES lag2 model') # generate forest results on detrended winsorized sales, without year lag of ISO 14001  
+
+```
+
+## 2 YEAR lag result2: ROA 
+```{r fig8, fig.height = 6, fig.width = 10}
+# baseline ROA model 
+myforest(seed=12,input=roa_2,p=0.4,title = 'ROA lag2 model') # generate forest results on ROA
+```
+
+## 2 YEAR lag result3: ROE 
+```{r fig9, fig.height = 6, fig.width = 10}
+# baseline ROE model 
+myforest(seed=12,input=roe_2,p=0.4,title = 'ROE lag2 model')  # generate forest results on ROE
+```
+
+

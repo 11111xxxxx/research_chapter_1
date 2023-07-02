@@ -1,0 +1,309 @@
+---
+title: "Step4_causal_tree"
+author: "Xiaoliuxu"
+date: "4/27/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warnings = FALSE, message = FALSE )
+```
+
+## Step 4: Causal tree estimation and plot 
+
+```{r, include=FALSE}
+# load library 
+library(dplyr)
+library(rpart)
+library(rpart.plot)
+library(data.table)
+library(devtools)
+library(causalTree)
+library(reshape2)
+library(summarytools)
+library(ggplot2)
+library(grid)
+library(libcoin)
+library(mvtnorm)
+library(partykit)
+library(randomForest)
+library(tidyverse)
+library(qwraps2)
+library(table1)
+library(foreach)
+library(iterators)
+library(modeltools)
+library(stats4)
+library(party)
+library(partykit)
+library(xtable)
+library(gtsummary)  # used to generate summary table 
+library(psych)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(htetree)
+```
+
+# Import data set 
+```{r}
+# import merge data set, which includes all other variables 
+merge2_psm <- read.table("merge2_psm.txt")
+exchange_rate <- read_excel('annual_exchange_rate.xlsx')
+
+mean_rate <- mean(exchange_rate$usd_per_won)
+
+merge2_psm$sales.usd <- merge2_psm$sales.w*mean_rate/1000000
+merge2_psm$adv.usd <- merge2_psm$advertising.expense.w*mean_rate/1000
+
+full_data_ct <- merge2_psm
+
+```
+
+# Predict sales on year 
+```{r}
+# predict sales on year 
+# variable selection 
+myvars <- c("ID","year","sales.usd","roa.w","roe.w","iso14001","public","ksic","region","leverage.w","turnover.w","export_ratio.w","size","rd_ratio.w","HHI.w","adv.usd","age","pr_score") # select specific columns used to generate causal forest 
+
+full_data_ct <- full_data_ct[myvars]
+full_data_ct$year2 <- ifelse(full_data_ct$year==2001,1,
+                             ifelse(full_data_ct$year==2002,2,
+                                    ifelse(full_data_ct$year==2003,3,
+                                           ifelse(full_data_ct$year==2004,4, 
+                                                  ifelse(full_data_ct$year==2005,5,
+                                                         ifelse(full_data_ct$year==2006,6,
+                                                                ifelse(full_data_ct$year==2007,7,
+                                                                       ifelse(full_data_ct$year==2008,8,
+                                                                              ifelse(full_data_ct$year==2009,9,
+                                                                                     ifelse(full_data_ct$year==2010,10,
+                                                                                            ifelse(full_data_ct$year==2011,11,
+                                                                                                   ifelse(full_data_ct$year==2012,12,
+                                                                                                          ifelse(full_data_ct$year==2013,13,
+                                                                                                                 ifelse(full_data_ct$year==2014,14,NA))))))))))))))
+# prediction for sales
+ols <- lm(sales.usd ~ year2,
+          data = full_data_ct)    # only include time trend 
+full_data_ct$predicted_sales <- predict(ols,data=full_data_ct)
+
+
+```
+
+
+# Prepare input dataset for causal tree 
+```{r}
+# prepare input dataset for causal tree 
+# sales selection 
+myvars <- c("ID","predicted_sales","iso14001","public","year","ksic","region","leverage.w","turnover.w","export_ratio.w","size","rd_ratio.w","HHI.w","adv.usd","age","pr_score") # select specific columns used to generate causal forest 
+
+sales <- full_data_ct[myvars]
+
+colnames(sales)[1:16] <- c("ID","y","w","public","year","ksic","region","debt_to_equity","sales_to_assets","export_ratio","size","rd_ratio","HHI","advertising_expense","age","propens")
+sales <- fastDummies::dummy_cols(sales,select_columns = "ksic")
+
+# ROA selection 
+myvars <- c("ID","roa.w","iso14001","public","year","ksic","region","leverage.w","turnover.w","export_ratio.w","size","rd_ratio.w","HHI.w","adv.usd","age","pr_score") # select specific columns used to generate causal forest 
+
+roa <- full_data_ct[myvars]
+
+colnames(roa)[1:16] <- c("ID","y","w","public","year","ksic","region","debt_to_equity","sales_to_assets","export_ratio","size","rd_ratio","HHI","advertising_expense","age","propens")
+roa <- fastDummies::dummy_cols(roa,select_columns = "ksic")
+
+# ROE selection 
+myvars <- c("ID","roe.w","iso14001","public","year","ksic","region","leverage.w","turnover.w","export_ratio.w","size","rd_ratio.w","HHI.w","adv.usd","age","pr_score") # select specific columns used to generate causal forest 
+
+roe <- full_data_ct[myvars]
+
+colnames(roe)[1:16] <- c("ID","y","w","public","year","ksic","region","debt_to_equity","sales_to_assets","export_ratio","size","rd_ratio","HHI","advertising_expense","age","propens")
+roe <- fastDummies::dummy_cols(roe,select_columns = "ksic")
+
+
+```
+
+
+# In this Block, I wrote a function to show the causal tree results. This function will allow us to split the data into training and test, and plot estimated trees on training and test sample respectively.  
+```{r}
+my_tree <- function(seed,input, p,minsize.temp,cv.option,split.Bucket, bucketNum, bucketMax, finaltree, plot_tree,main1, main2){
+  # training/test sample splitting 
+  set.seed(seed)
+  g <- runif(nrow(input))
+  full_data_ct_r <- input[order(g),]
+  # method 1 to split data 
+  # library(caret)
+  # train.index <- createDataPartition(full_data_ct_r$w, p =p, list = FALSE)
+  # dataDisTrain <- full_data_ct_r[ train.index,]
+  # dataDisTest  <- full_data_ct_r[-train.index,]
+  
+  # method 2 to split data 
+  # n <- nrow(input)
+  # ntr <- ROUND(0.75*n)
+  # ntest <- round(0.25*n)
+  # dataDisTrain <- full_data_ct_r
+  
+  # method 3 to split data 
+  library(groupdata2)
+  full_data_ct_r$ID <- factor(full_data_ct_r$ID)
+  parts <- partition(full_data_ct_r, p = p, id_col = "ID") # here p represent the fraction for test data 
+  dataDisTest <<- parts[[1]]
+  dataDisTrain <<- parts[[2]]
+
+  tree <- htetree::causalTree(as.formula("y~sales_to_assets+export_ratio+rd_ratio+public+size+advertising_expense+age+debt_to_equity+ksic_10+ksic_25+ksic_13+
+                                ksic_26+ksic_31+ksic_23+ksic_24+ksic_30+ksic_14+ksic_18+ksic_29+ksic_22+ksic_28+
+                                ksic_20+ksic_27+ksic_21+ksic_19+ksic_32+ksic_17+ksic_33+ksic_11+ksic_15+ksic_16+ksic_12"), # age+ debt_to_equity+ no hhi, adv, ln_employee
+                     data=dataDisTrain, treatment=dataDisTrain$w, 
+                     split.Rule='CT', split.Honest=F, cv.option=cv.option, cv.Honest=F, minsize = minsize.temp, 
+                     xval=10, cp=0, split.Bucket = split.Bucket, bucketNum = bucketNum, bucketMax = bucketMax)
+  opcpid <- which.min(tree$cp[,4])
+  opcp <- tree$cp[opcpid,1]
+  tree_prune <- prune(tree, cp = opcp) 
+  finaltree <- tree_prune
+  rpart.plot(finaltree, cex=0.7,
+            split.round=.5,main =main1,split.prefix="is ", 
+             split.suffix="?") # plot the tree for training data
+  tree_prune_test <- estimate.causalTree(object=finaltree,data=dataDisTest, treatment=dataDisTest$w) # estimate the selected tree on the test sample 
+  rpart.plot(tree_prune_test, cex=0.7,
+             split.round=.5,main =main2,split.prefix="is ", 
+             split.suffix="?") # plot the tree for test data
+  
+}
+
+```
+
+
+
+
+# sales(baseline,detrended) tree
+# commented out, wasn't run in this version 
+```{r}
+# my_tree(seed=36,p=0.3,input=sales,minsize.temp= 350, cv.option = 'CT', split.Bucket = T,bucketNum= 5,  bucketMax = 10,finaltree=sales_tree,
+#         main1 = "causal tree for sales on training data", main2 = "causal tree for sales on test data") #sales
+
+```
+
+# ROA(baseline) tree 
+# commented out, wasn't run in this version 
+```{r}
+# my_tree(seed=14,p=0.3,input=roa,minsize.temp=300,cv.option = 'CT', split.Bucket = T,bucketNum= 5,  bucketMax = 10, finaltree=ROA_tree,
+#         main1 = "causal tree for ROA on training data", main2 = "causal tree for ROA on test data") #roa, good results
+
+
+# 7 & 350 
+```
+
+```{r}
+# my_tree(seed=47,p=0.75,input=roa,minsize.temp=300,cv.option = 'CT', split.Bucket = T,bucketNum= 5,  bucketMax = 10, finaltree=ROA_tree,
+#         main1 = "causal tree for ROA on training data", main2 = "causal tree for ROA on test data") #roa, good results
+
+```
+
+
+# ROE(baseline) tree 
+# commented out, wasn't run in this version 
+```{r}
+# my_tree(seed=6,p=0.6,input=roe,minsize.temp=350,cv.option = 'CT', split.Bucket = T,bucketNum= 5,  bucketMax = 10, finaltree=ROE_tree,
+#         main1 = "causal tree for ROE on training data", main2 = "causal tree for ROE on test data") # roe 
+
+```
+
+# I wrote a function to run and plot the causal tree on the whole sample 
+```{r}
+my_tree_wsample <- function(seed,input, minsize.temp,cv.option,split.Bucket, bucketNum, bucketMax, finaltree, plot_tree,main1){
+  # training/test sample splitting 
+  set.seed(seed)
+  g <- runif(nrow(input))
+  full_data_ct_r <- input[order(g),]
+  # method 4: use the whole sample to generate the causal tree 
+  dataDisTrain <- full_data_ct_r
+  tree <- htetree::causalTree(as.formula("y~sales_to_assets+export_ratio+rd_ratio+public+size+advertising_expense+age+debt_to_equity+ksic_10+ksic_25+ksic_13+
+                                ksic_26+ksic_31+ksic_23+ksic_24+ksic_30+ksic_14+ksic_18+ksic_29+ksic_22+ksic_28+
+                                ksic_20+ksic_27+ksic_21+ksic_19+ksic_32+ksic_17+ksic_33+ksic_11+ksic_15+ksic_16+ksic_12"), # age+ debt_to_equity+ no hhi, adv, ln_employee
+                     data=dataDisTrain, treatment=dataDisTrain$w, 
+                     split.Rule='CT', split.Honest=F, cv.option=cv.option, cv.Honest=F, minsize = minsize.temp, 
+                     xval=10, cp=0, split.Bucket = split.Bucket, bucketNum = bucketNum, bucketMax = bucketMax)
+  opcpid <- which.min(tree$cp[,4])
+  opcp <- tree$cp[opcpid,1]
+  tree_prune <- prune(tree, cp = opcp) 
+  finaltree <- tree_prune
+  rpart.plot(finaltree, cex=0.7,
+            split.round=.5,main =main1,split.prefix="is ", 
+             split.suffix="?") # plot the tree for training data
+  imp <- data.frame(htetree::importance(finaltree))
+  imp1 <<- imp
+  #varImpPlot(finaltree,type=2)
+  sum <- summary(finaltree)
+  sum
+}
+
+```
+
+# a function to plot the variable importance 
+# A variable’s importance is the sum of the improvement in the overall RMSE measure produced by the nodes in which it appears. 
+```{r}
+varplot <- function(input){
+  df2 <- input %>% 
+  tibble::rownames_to_column() %>% 
+  dplyr::rename("variable" = rowname) %>% 
+  dplyr::rename("imp" = htetree..importance.finaltree.) %>% 
+  dplyr::arrange(imp) %>%
+  dplyr::mutate(variable = forcats::fct_inorder(variable))
+
+  ggplot2::ggplot(df2) +
+  geom_segment(aes(x = variable, y = 0, xend = variable, yend = imp), 
+               size = 2, alpha = 2) +
+  geom_point(aes(x = variable, y = imp, col = variable), 
+             size = 4, show.legend = F) +
+  coord_flip() +
+  labs(x ="Variable", y = "Variable Importance") +
+  theme_bw() 
+  
+}
+```
+
+```{r}
+imp_sales_plot
+```
+
+
+# Sales(baseline) tree 
+```{r}
+my_tree_wsample(seed=503,input=sales,minsize.temp=750,cv.option = 'CT', split.Bucket = F,bucketNum= 5,  bucketMax = 100, finaltree=ROA_tree,main1 = "causal tree for sales on whole data") 
+
+imp_sales <- imp1
+
+imp_sales_plot<- varplot(imp_sales)
+
+imp_sales_plot
+```
+
+# ROA(baseline) tree 
+```{r}
+my_tree_wsample(seed=18,input=roa,minsize.temp=350,cv.option = 'CT', split.Bucket = T,bucketNum= 5,  bucketMax = 100, finaltree=ROA_tree,main1 = "causal tree for ROA on whole data") 
+
+imp_roa <- imp1
+
+imp_roa_plot<- varplot(imp_roa)
+
+imp_roa_plot
+```
+
+# ROE(baseline) tree 
+```{r}
+my_tree_wsample(seed=4,input=roe,minsize.temp=350,cv.option = 'CT', split.Bucket = T,bucketNum= 5,  bucketMax = 100, finaltree=ROA_tree,main1 = "causal tree for ROE on whole data") 
+
+imp_roe <- imp1
+
+imp_roe_plot <- varplot(imp_roe)
+
+imp_roe_plot
+```
+
+# put all three importance plots together 
+```{r}
+
+par(mfrow=c(2,2))
+varplot(imp_sales)
+varplot(imp_roa)
+varplot(imp_roe)
+```
+
+# Conclusion: the ROA and ROE results are very similar to the ones in my dissertation 
